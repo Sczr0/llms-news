@@ -1,0 +1,20 @@
+{
+  "name": "news-radar-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-05",
+  "vars": {
+    "SHARED_TOKEN": "9396d7f5ce35d86b8b016529136372bd76bc039a4d4cac604903b3e3bc695c71",
+    "PER_SOURCE_LIMIT": "20",
+    "REQUEST_TIMEOUT_MS": "12000",
+    "EXTRA_RSS_SOURCES": "[]"
+  },
+  "routes": [
+    {
+      "pattern": "llms-news.xtower.site/*",
+      "zone_name": "xtower.site"
+    }
+  ],
+  "triggers": {
+    "crons": ["*/15 * * * *"]
+  }
+}

@@ -1,0 +1,12 @@
+# Node
+worker/node_modules/
+
+# Rust
+scheduler/target/
+
+# Runtime data
+scheduler/data/
+
+# Env
+*.env
+*.local

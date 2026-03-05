@@ -1,0 +1,58 @@
+{
+  "default_tier": "P2",
+  "notify_min_score": {
+    "P0": 80,
+    "P1": 72,
+    "P2": 65
+  },
+  "rules": [
+    {
+      "tier": "P0",
+      "source_name_equals": [
+        "openai-news",
+        "google-deepmind",
+        "google-ai-blog",
+        "huggingface-blog",
+        "stability-ai-news",
+        "anthropic-news-web",
+        "baidu-qianfan-web",
+        "aliyun-modelstudio-release-notes",
+        "zhipu-news-web",
+        "deepseek-updates-web",
+        "volcengine-ark-docs-web",
+        "minimax-news-web",
+        "moonshot-blog-web",
+        "huggingface-trending-models"
+      ]
+    },
+    {
+      "tier": "P1",
+      "source_name_equals": [
+        "github-trending-ai",
+        "linuxdo-latest",
+        "linuxdo-top",
+        "v2ex-hot",
+        "v2ex-tech",
+        "reddit-machinelearning",
+        "reddit-localllama",
+        "reddit-artificial",
+        "reddit-singularity",
+        "hn-ai",
+        "hn-llm",
+        "hn-gemini-gpt",
+        "jiqizhixin",
+        "ithome",
+        "techcrunch-ai",
+        "venturebeat-ai",
+        "theverge-ai",
+        "wired-ai"
+      ]
+    },
+    {
+      "tier": "P2",
+      "source_kind_equals": [
+        "rss"
+      ]
+    }
+  ]
+}
