@@ -1,0 +1,48 @@
+name: Build Scheduler
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "scheduler/**"
+      - ".github/workflows/build-scheduler.yml"
+      - ".env.example"
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    env:
+      BIN_NAME: news-radar-scheduler
+      ARTIFACT_DIR: dist
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: scheduler-release-linux
+
+      - name: Build release binary
+        working-directory: scheduler
+        run: cargo build --release
+
+      - name: Collect runtime files
+        run: |
+          mkdir -p "${ARTIFACT_DIR}/config"
+          cp "scheduler/target/release/${BIN_NAME}" "${ARTIFACT_DIR}/${BIN_NAME}"
+          cp "scheduler/config/source_tiers.json" "${ARTIFACT_DIR}/config/source_tiers.json"
+          cp ".env.example" "${ARTIFACT_DIR}/.env.example"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scheduler-linux-x86_64
+          path: dist/
+          if-no-files-found: error

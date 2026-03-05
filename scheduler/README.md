@@ -17,6 +17,30 @@ cp ../.env.example .env
 cargo run
 ```
 
+## Build via GitHub Actions (no Rust on server)
+
+This repo provides `.github/workflows/build-scheduler.yml`.
+
+- Trigger:
+  - push to `main` (when `scheduler/**` changes), or
+  - run manually from GitHub Actions (`workflow_dispatch`).
+- Output artifact name: `scheduler-linux-x86_64`
+- Artifact files:
+  - `news-radar-scheduler`
+  - `config/source_tiers.json`
+  - `.env.example`
+
+Deploy on server:
+
+```bash
+# 1) download and unzip artifact from GitHub Actions
+# 2) put files into your deploy directory, e.g. /opt/news-radar/scheduler
+chmod +x news-radar-scheduler
+cp .env.example .env
+# edit .env: WORKER_BASE_URL / WORKER_SHARED_TOKEN / NOTIFY_WEBHOOK ...
+./news-radar-scheduler
+```
+
 ## Key env vars
 
 - `WORKER_BASE_URL`
