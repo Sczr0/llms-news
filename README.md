@@ -27,7 +27,7 @@ news-radar/
 - Scheduler stores data in SQLite (`raw_items`, `events`, `alerts`).
 - Rule-based classification/scoring is enabled.
 - Source tier routing (`P0/P1/P2`) is configurable via `scheduler/config/source_tiers.json`.
-- Optional OpenAI-compatible LLM enrichment is supported.
+- Scheduler uses dual-LLM pipeline (small model filter + big model Chinese rewrite).
 
 ## 1) Run Worker
 

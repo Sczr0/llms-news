@@ -1,13 +1,16 @@
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::header::{HeaderMap, HeaderValue};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
 
 #[derive(Debug, Clone)]
@@ -22,15 +25,25 @@ struct Config {
     harvest_rounds: usize,
     round_sleep_secs: u64,
     candidate_min_score: i32,
-    llm: Option<LlmConfig>,
+    small_llm: Option<SmallLlmConfig>,
+    big_llm: Option<BigLlmConfig>,
 }
 
 #[derive(Debug, Clone)]
-struct LlmConfig {
+struct SmallLlmConfig {
+    api_base: String,
+    api_key: String,
+    model: String,
+    concurrency: usize,
+}
+
+#[derive(Debug, Clone)]
+struct BigLlmConfig {
     api_base: String,
     api_key: String,
     model: String,
     max_items: usize,
+    concurrency: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,22 +106,39 @@ struct Candidate {
     title: String,
     url: String,
     source: String,
+    content: String,
     published_at: String,
     reason: String,
+    summary: Option<String>,
     angle: Option<String>,
     opinion: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct LlmDecision {
+struct SmallLlmDecision {
+    is_ai_related: Option<bool>,
+    topic: Option<String>,
+    score_adjustment: Option<i32>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BigLlmDecision {
+    category: Option<String>,
+    title_zh: Option<String>,
+    summary_zh: Option<String>,
     topic: Option<String>,
     score_adjustment: Option<i32>,
     angle: Option<String>,
     opinion: Option<String>,
 }
 
-fn llm_system_prompt() -> &'static str {
-    "You are a news classifier for AI writing pipeline. Return strict JSON with keys: topic(open_source_tool|ai_news|model_eval), score_adjustment(integer -20..20), angle(short writing angle), opinion(short subjective opinion)."
+fn small_llm_system_prompt() -> &'static str {
+    "You are an AI news gatekeeper. Return strict JSON with keys: is_ai_related(boolean), topic(open_source_tool|ai_news|model_eval|unknown), score_adjustment(integer -20..20), reason(short)."
+}
+
+fn big_llm_system_prompt() -> &'static str {
+    "You are a Chinese AI editor. Return strict JSON with keys: category(open_source_tool|ai_news|model_eval), title_zh, summary_zh(2-4 sentences in Chinese), angle(one Chinese sentence), opinion(one Chinese sentence with viewpoint)."
 }
 
 fn strip_markdown_code_fence(raw: &str) -> String {
@@ -132,12 +162,12 @@ fn strip_markdown_code_fence(raw: &str) -> String {
     lines.join("\n").trim().to_string()
 }
 
-fn parse_llm_decision(content: &str) -> Option<LlmDecision> {
+fn parse_json_value(content: &str) -> Option<serde_json::Value> {
     let normalized = strip_markdown_code_fence(content);
     if normalized.trim().is_empty() {
         return None;
     }
-    serde_json::from_str::<LlmDecision>(normalized.trim()).ok()
+    serde_json::from_str::<serde_json::Value>(normalized.trim()).ok()
 }
 
 fn extract_text_from_chat_payload(payload: &serde_json::Value) -> Option<String> {
@@ -366,9 +396,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if cfg.llm.is_some() {
-        enrich_candidates_by_llm(&client, &cfg, &mut candidates).await?;
+    candidates = filter_candidates_by_small_llm(&client, &cfg, candidates).await?;
+    if candidates.is_empty() {
+        println!("[scheduler] no candidates after small-llm filtering");
+        return Ok(());
     }
+
+    candidates = enrich_candidates_by_big_llm(&client, &cfg, candidates).await?;
 
     candidates.sort_by(|a, b| b.score.cmp(&a.score));
 
@@ -425,23 +459,73 @@ fn load_config() -> Result<Config> {
         .and_then(|v| v.parse::<i32>().ok())
         .unwrap_or(70);
 
-    let llm_api_base = env::var("LLM_API_BASE").ok().map(|v| v.trim().to_string());
-    let llm_api_key = env::var("LLM_API_KEY").ok().map(|v| v.trim().to_string());
-    let llm_model = env::var("LLM_MODEL").ok().map(|v| v.trim().to_string());
-    let llm_max_items = env::var("LLM_MAX_ITEMS")
+    let small_llm_api_base = env::var("SMALL_LLM_API_BASE")
+        .ok()
+        .map(|v| v.trim().to_string());
+    let small_llm_api_key = env::var("SMALL_LLM_API_KEY")
+        .ok()
+        .map(|v| v.trim().to_string());
+    let small_llm_model = env::var("SMALL_LLM_MODEL")
+        .ok()
+        .map(|v| v.trim().to_string());
+    let small_llm_concurrency = env::var("SMALL_LLM_CONCURRENCY")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(8);
 
-    let llm = match (llm_api_base, llm_api_key, llm_model) {
+    let legacy_llm_api_base = env::var("LLM_API_BASE").ok().map(|v| v.trim().to_string());
+    let legacy_llm_api_key = env::var("LLM_API_KEY").ok().map(|v| v.trim().to_string());
+    let legacy_llm_model = env::var("LLM_MODEL").ok().map(|v| v.trim().to_string());
+    let legacy_llm_max_items = env::var("LLM_MAX_ITEMS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8);
+
+    let big_llm_api_base = env::var("BIG_LLM_API_BASE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .or_else(|| legacy_llm_api_base.clone());
+    let big_llm_api_key = env::var("BIG_LLM_API_KEY")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .or_else(|| legacy_llm_api_key.clone());
+    let big_llm_model = env::var("BIG_LLM_MODEL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .or_else(|| legacy_llm_model.clone());
+    let big_llm_max_items = env::var("BIG_LLM_MAX_ITEMS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(legacy_llm_max_items);
+    let big_llm_concurrency = env::var("BIG_LLM_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4);
+
+    let small_llm = match (small_llm_api_base, small_llm_api_key, small_llm_model) {
         (Some(api_base), Some(api_key), Some(model))
             if !api_base.is_empty() && !api_key.is_empty() && !model.is_empty() =>
         {
-            Some(LlmConfig {
+            Some(SmallLlmConfig {
                 api_base: api_base.trim_end_matches('/').to_string(),
                 api_key,
                 model,
-                max_items: llm_max_items,
+                concurrency: small_llm_concurrency.max(1),
+            })
+        }
+        _ => None,
+    };
+
+    let big_llm = match (big_llm_api_base, big_llm_api_key, big_llm_model) {
+        (Some(api_base), Some(api_key), Some(model))
+            if !api_base.is_empty() && !api_key.is_empty() && !model.is_empty() =>
+        {
+            Some(BigLlmConfig {
+                api_base: api_base.trim_end_matches('/').to_string(),
+                api_key,
+                model,
+                max_items: big_llm_max_items,
+                concurrency: big_llm_concurrency.max(1),
             })
         }
         _ => None,
@@ -458,7 +542,8 @@ fn load_config() -> Result<Config> {
         harvest_rounds,
         round_sleep_secs,
         candidate_min_score,
-        llm,
+        small_llm,
+        big_llm,
     })
 }
 
@@ -608,8 +693,10 @@ fn upsert_item_and_build_candidate(
         title: item.title.clone(),
         url: item.url.clone(),
         source: item.source.clone(),
+        content: item.content.clone(),
         published_at: item.published_at.clone(),
         reason,
+        summary: None,
         angle: None,
         opinion: None,
     }))
@@ -701,75 +788,317 @@ fn is_recent_48h(published_at: &str) -> bool {
     false
 }
 
-async fn enrich_candidates_by_llm(
+fn normalize_topic(topic: &str) -> Option<String> {
+    let t = topic.trim().to_lowercase();
+    match t.as_str() {
+        "open_source_tool" | "ai_news" | "model_eval" => Some(t),
+        _ => None,
+    }
+}
+
+fn topic_label_zh(topic: &str) -> &'static str {
+    match topic {
+        "open_source_tool" => "\u{5f00}\u{6e90}\u{5de5}\u{5177}",
+        "model_eval" => "\u{6a21}\u{578b}\u{6d4b}\u{8bc4}",
+        _ => "AI\u{8d44}\u{8baf}",
+    }
+}
+
+fn is_ai_related_fallback(candidate: &Candidate) -> bool {
+    let text = format!(
+        "{} {} {}",
+        candidate.title.to_lowercase(),
+        candidate.source.to_lowercase(),
+        candidate.content.to_lowercase()
+    );
+    contains_any(
+        &text,
+        &[
+            "ai",
+            "llm",
+            "gpt",
+            "gemini",
+            "claude",
+            "agent",
+            "model",
+            "openai",
+            "anthropic",
+            "deepseek",
+            "qwen",
+            "kimi",
+            "doubao",
+            "wenxin",
+        ],
+    )
+}
+
+async fn filter_candidates_by_small_llm(
     client: &reqwest::Client,
     cfg: &Config,
-    candidates: &mut [Candidate],
-) -> Result<()> {
-    let Some(llm) = &cfg.llm else {
-        return Ok(());
+    candidates: Vec<Candidate>,
+) -> Result<Vec<Candidate>> {
+    let Some(llm) = &cfg.small_llm else {
+        bail!("small-llm is required, set SMALL_LLM_API_BASE/KEY/MODEL");
     };
-    let max_items = llm.max_items.min(candidates.len());
-    for candidate in candidates.iter_mut().take(max_items) {
-        if let Some(decision) = call_llm_for_candidate(client, llm, candidate).await? {
-            if let Some(topic) = decision.topic {
-                if matches!(
-                    topic.as_str(),
-                    "open_source_tool" | "ai_news" | "model_eval"
-                ) {
+
+    let sem = Arc::new(Semaphore::new(llm.concurrency.max(1)));
+    let mut set: JoinSet<(Candidate, Option<SmallLlmDecision>)> = JoinSet::new();
+
+    for candidate in candidates {
+        let client = client.clone();
+        let llm_cfg = llm.clone();
+        let sem = Arc::clone(&sem);
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.ok();
+            let decision = call_small_llm_for_candidate(&client, &llm_cfg, &candidate)
+                .await
+                .ok()
+                .flatten();
+            (candidate, decision)
+        });
+    }
+
+    let mut kept = Vec::new();
+    let mut dropped = 0usize;
+    let mut fallback_kept = 0usize;
+
+    while let Some(joined) = set.join_next().await {
+        let Ok((mut candidate, decision)) = joined else {
+            continue;
+        };
+
+        match decision {
+            Some(d) => {
+                let mut keep = d
+                    .is_ai_related
+                    .unwrap_or_else(|| is_ai_related_fallback(&candidate));
+                if !keep && is_ai_related_fallback(&candidate) {
+                    keep = true;
+                    fallback_kept += 1;
+                }
+                if !keep {
+                    dropped += 1;
+                    continue;
+                }
+                if let Some(topic) = d.topic.and_then(|t| normalize_topic(&t)) {
                     candidate.topic = topic;
                 }
+                if let Some(adjust) = d.score_adjustment {
+                    candidate.score = (candidate.score + adjust).clamp(0, 100);
+                }
+                if let Some(reason) = d.reason {
+                    let reason = reason.trim();
+                    if !reason.is_empty() {
+                        candidate.reason = format!("small-llm:{reason}");
+                    }
+                }
+                kept.push(candidate);
             }
-            if let Some(adjustment) = decision.score_adjustment {
-                candidate.score = (candidate.score + adjustment).clamp(0, 100);
-            }
-            if let Some(angle) = decision.angle {
-                if !angle.trim().is_empty() {
-                    candidate.angle = Some(angle.trim().to_string());
+            None => {
+                if is_ai_related_fallback(&candidate) {
+                    fallback_kept += 1;
+                    candidate.reason = "small-llm:fallback-rule".to_string();
+                    kept.push(candidate);
+                } else {
+                    dropped += 1;
                 }
             }
-            if let Some(opinion) = decision.opinion {
-                if !opinion.trim().is_empty() {
-                    candidate.opinion = Some(opinion.trim().to_string());
-                }
-            }
-            candidate.reason = "rule-score-hit+llm".to_string();
         }
     }
-    Ok(())
-}
 
-async fn call_llm_for_candidate(
-    client: &reqwest::Client,
-    llm: &LlmConfig,
-    candidate: &Candidate,
-) -> Result<Option<LlmDecision>> {
-    let prompt = format!(
-        "title: {}\nsource: {}\nurl: {}\ncurrent_topic: {}\ncurrent_score: {}\n",
-        candidate.title, candidate.source, candidate.url, candidate.topic, candidate.score
+    println!(
+        "[scheduler] small-llm filtered: kept={} dropped={} fallback_kept={}",
+        kept.len(),
+        dropped,
+        fallback_kept
     );
-    if let Some(decision) = call_llm_via_responses(client, llm, &prompt).await? {
-        return Ok(Some(decision));
-    }
-    call_llm_via_chat_completions(client, llm, &prompt).await
+
+    Ok(kept)
 }
 
-async fn call_llm_via_responses(
+async fn enrich_candidates_by_big_llm(
     client: &reqwest::Client,
-    llm: &LlmConfig,
-    prompt: &str,
-) -> Result<Option<LlmDecision>> {
-    let url = format!("{}/responses", llm.api_base);
+    cfg: &Config,
+    mut candidates: Vec<Candidate>,
+) -> Result<Vec<Candidate>> {
+    let Some(llm) = &cfg.big_llm else {
+        bail!("big-llm is required, set BIG_LLM_API_BASE/KEY/MODEL");
+    };
+
+    candidates.sort_by(|a, b| b.score.cmp(&a.score));
+    let limit = if llm.max_items == 0 {
+        candidates.len()
+    } else {
+        llm.max_items.min(candidates.len())
+    };
+
+    let sem = Arc::new(Semaphore::new(llm.concurrency.max(1)));
+    let mut set: JoinSet<(usize, Candidate, Option<BigLlmDecision>)> = JoinSet::new();
+
+    for (idx, item) in candidates.iter().take(limit).enumerate() {
+        let client = client.clone();
+        let llm_cfg = llm.clone();
+        let sem = Arc::clone(&sem);
+        let candidate = item.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.ok();
+            let decision = call_big_llm_for_candidate(&client, &llm_cfg, &candidate)
+                .await
+                .ok()
+                .flatten();
+            (idx, candidate, decision)
+        });
+    }
+
+    while let Some(joined) = set.join_next().await {
+        let Ok((idx, mut candidate, decision)) = joined else {
+            continue;
+        };
+        if let Some(d) = decision {
+            if let Some(topic) = d
+                .category
+                .as_deref()
+                .and_then(normalize_topic)
+                .or_else(|| d.topic.as_deref().and_then(normalize_topic))
+            {
+                candidate.topic = topic;
+            }
+            if let Some(adjust) = d.score_adjustment {
+                candidate.score = (candidate.score + adjust).clamp(0, 100);
+            }
+            if let Some(title_zh) = d.title_zh {
+                let text = title_zh.trim();
+                if !text.is_empty() {
+                    candidate.title = truncate_chars(text, 120);
+                }
+            }
+            if let Some(summary_zh) = d.summary_zh {
+                let text = summary_zh.trim();
+                if !text.is_empty() {
+                    candidate.summary = Some(truncate_chars(text, 600));
+                }
+            }
+            if let Some(angle) = d.angle {
+                let text = angle.trim();
+                if !text.is_empty() {
+                    candidate.angle = Some(truncate_chars(text, 200));
+                }
+            }
+            if let Some(opinion) = d.opinion {
+                let text = opinion.trim();
+                if !text.is_empty() {
+                    candidate.opinion = Some(truncate_chars(text, 200));
+                }
+            }
+            candidate.reason = format!("{}+big-llm", candidate.reason);
+        }
+        candidates[idx] = candidate;
+    }
+
+    println!(
+        "[scheduler] big-llm enriched: processed={} total={}",
+        limit,
+        candidates.len()
+    );
+    Ok(candidates)
+}
+
+async fn call_small_llm_for_candidate(
+    client: &reqwest::Client,
+    llm: &SmallLlmConfig,
+    candidate: &Candidate,
+) -> Result<Option<SmallLlmDecision>> {
+    let user_prompt = format!(
+        "title: {}\nsource: {}\nurl: {}\npublished_at: {}\nraw_content: {}\ncurrent_topic: {}\ncurrent_score: {}\n",
+        candidate.title,
+        candidate.source,
+        candidate.url,
+        candidate.published_at,
+        truncate_chars(&candidate.content, 1200),
+        candidate.topic,
+        candidate.score
+    );
+    let Some(payload) = call_llm_json(
+        client,
+        &llm.api_base,
+        &llm.api_key,
+        &llm.model,
+        small_llm_system_prompt(),
+        &user_prompt,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_value::<SmallLlmDecision>(payload).ok())
+}
+
+async fn call_big_llm_for_candidate(
+    client: &reqwest::Client,
+    llm: &BigLlmConfig,
+    candidate: &Candidate,
+) -> Result<Option<BigLlmDecision>> {
+    let user_prompt = format!(
+        "Please rewrite this item into readable Chinese and classify it.\n\ntitle: {}\nsource: {}\nurl: {}\npublished_at: {}\nraw_content: {}\ncurrent_topic: {}\ncurrent_score: {}\n",
+        candidate.title,
+        candidate.source,
+        candidate.url,
+        candidate.published_at,
+        truncate_chars(&candidate.content, 1500),
+        candidate.topic,
+        candidate.score
+    );
+    let Some(payload) = call_llm_json(
+        client,
+        &llm.api_base,
+        &llm.api_key,
+        &llm.model,
+        big_llm_system_prompt(),
+        &user_prompt,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_value::<BigLlmDecision>(payload).ok())
+}
+
+async fn call_llm_json(
+    client: &reqwest::Client,
+    api_base: &str,
+    api_key: &str,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<Option<serde_json::Value>> {
+    if let Some(payload) =
+        call_llm_json_via_responses(client, api_base, api_key, model, system_prompt, user_prompt)
+            .await?
+    {
+        return Ok(Some(payload));
+    }
+    call_llm_json_via_chat(client, api_base, api_key, model, system_prompt, user_prompt).await
+}
+
+async fn call_llm_json_via_responses(
+    client: &reqwest::Client,
+    api_base: &str,
+    api_key: &str,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<Option<serde_json::Value>> {
+    let url = format!("{}/responses", api_base);
     let body = serde_json::json!({
-      "model": llm.model,
+      "model": model,
       "temperature": 0.2,
-      "instructions": llm_system_prompt(),
-      "input": prompt,
+      "instructions": system_prompt,
+      "input": user_prompt,
       "text": { "format": { "type": "json_object" } }
     });
     let resp = client
         .post(url)
-        .bearer_auth(&llm.api_key)
+        .bearer_auth(api_key)
         .json(&body)
         .send()
         .await;
@@ -788,33 +1117,36 @@ async fn call_llm_via_responses(
     let Some(content) = content else {
         return Ok(None);
     };
-    Ok(parse_llm_decision(&content))
+    Ok(parse_json_value(&content))
 }
 
-async fn call_llm_via_chat_completions(
+async fn call_llm_json_via_chat(
     client: &reqwest::Client,
-    llm: &LlmConfig,
-    prompt: &str,
-) -> Result<Option<LlmDecision>> {
-    let url = format!("{}/chat/completions", llm.api_base);
+    api_base: &str,
+    api_key: &str,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<Option<serde_json::Value>> {
+    let url = format!("{}/chat/completions", api_base);
     let body = serde_json::json!({
-      "model": llm.model,
+      "model": model,
       "temperature": 0.2,
       "response_format": { "type": "json_object" },
       "messages": [
         {
           "role": "system",
-          "content": llm_system_prompt()
+          "content": system_prompt
         },
         {
           "role": "user",
-          "content": prompt
+          "content": user_prompt
         }
       ]
     });
     let resp = client
         .post(url)
-        .bearer_auth(&llm.api_key)
+        .bearer_auth(api_key)
         .json(&body)
         .send()
         .await;
@@ -825,15 +1157,15 @@ async fn call_llm_via_chat_completions(
         Ok(v) => v,
         Err(_) => return Ok(None),
     };
-    let parsed = match resp.json::<serde_json::Value>().await {
+    let payload = match resp.json::<serde_json::Value>().await {
         Ok(v) => v,
         Err(_) => return Ok(None),
     };
-    let content = extract_text_from_chat_payload(&parsed);
+    let content = extract_text_from_chat_payload(&payload);
     let Some(content) = content else {
         return Ok(None);
     };
-    Ok(parse_llm_decision(&content))
+    Ok(parse_json_value(&content))
 }
 
 async fn notify_candidates(
@@ -846,16 +1178,19 @@ async fn notify_candidates(
         if already_alerted(conn, &item.url_hash)? {
             continue;
         }
+        let topic_zh = topic_label_zh(&item.topic);
+        let summary = item.summary.clone().unwrap_or_else(|| "-".to_string());
 
         let msg = format!(
-            "[{}][{}][score={}]\n{}\nsource={}\npublished_at={}\nurl={}\nreason={}\nangle={}\nopinion={}",
+            "[{}][{}][score={}]\n{}\nsource={}\npublished_at={}\nurl={}\nsummary={}\nreason={}\nangle={}\nopinion={}",
             item.tier,
-            item.topic,
+            topic_zh,
             item.score,
             item.title,
             item.source,
             item.published_at,
             item.url,
+            summary,
             item.reason,
             item.angle.clone().unwrap_or_else(|| "-".to_string()),
             item.opinion.clone().unwrap_or_else(|| "-".to_string())
@@ -914,8 +1249,10 @@ fn build_webhook_payload(webhook: &str, item: &Candidate, fallback_msg: &str) ->
     if webhook.contains("open.feishu.cn") {
         let angle = item.angle.clone().unwrap_or_else(|| "-".to_string());
         let opinion = item.opinion.clone().unwrap_or_else(|| "-".to_string());
+        let summary = item.summary.clone().unwrap_or_else(|| "-".to_string());
         let title = truncate_chars(&item.title, 90);
         let reason = truncate_chars(&item.reason, 120);
+        let topic_zh = topic_label_zh(&item.topic);
         serde_json::json!({
           "msg_type": "interactive",
           "card": {
@@ -927,7 +1264,7 @@ fn build_webhook_payload(webhook: &str, item: &Candidate, fallback_msg: &str) ->
               "template": feishu_header_color(item.score),
               "title": {
                 "tag": "plain_text",
-                "content": format!("[{}][{}][{}] {}", item.tier, item.topic, item.score, title)
+                "content": format!("[{}][{}][{}] {}", item.tier, topic_zh, item.score, title)
               }
             },
             "elements": [
@@ -963,6 +1300,13 @@ fn build_webhook_payload(webhook: &str, item: &Candidate, fallback_msg: &str) ->
                     }
                   }
                 ]
+              },
+              {
+                "tag": "div",
+                "text": {
+                  "tag": "lark_md",
+                  "content": format!("**Summary**\\n{}", truncate_chars(&summary, 600))
+                }
               },
               {
                 "tag": "div",

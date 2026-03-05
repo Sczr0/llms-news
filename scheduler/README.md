@@ -7,7 +7,7 @@ Rust scheduler for:
 - Dedupe + store in SQLite.
 - Rule-based classification/scoring.
 - Tier routing by configurable file (`P0/P1/P2`).
-- Optional LLM enrichment (OpenAI-compatible API).
+- Dual-LLM pipeline (small filter + big Chinese rewrite, OpenAI-compatible API).
 - Notification (console or webhook, Feishu interactive card supported).
 
 ## Run
@@ -50,16 +50,24 @@ cp .env.example .env
 - `HARVEST_ROUNDS`
 - `CANDIDATE_MIN_SCORE`
 - `NOTIFY_WEBHOOK`
-- `LLM_API_BASE` / `LLM_API_KEY` / `LLM_MODEL`
+- `SMALL_LLM_API_BASE` / `SMALL_LLM_API_KEY` / `SMALL_LLM_MODEL` / `SMALL_LLM_CONCURRENCY`
+- `BIG_LLM_API_BASE` / `BIG_LLM_API_KEY` / `BIG_LLM_MODEL` / `BIG_LLM_MAX_ITEMS` / `BIG_LLM_CONCURRENCY`
 
 Production example:
 
 - `WORKER_BASE_URL=https://llms-news.xtower.site`
 
-LLM protocol behavior:
+Dual-LLM pipeline:
 
-- Scheduler tries `POST {LLM_API_BASE}/responses` first.
-- If `responses` fails or payload cannot be parsed, it falls back to `POST {LLM_API_BASE}/chat/completions`.
+- Small LLM: runs on all new items, filters AI-related content first.
+- Big LLM: rewrites/classifies filtered items to readable Chinese summaries.
+- Both stages support independent concurrency limits.
+- Scheduler requires both `SMALL_LLM_*` and `BIG_LLM_*` to run.
+
+LLM protocol behavior (both small and big models):
+
+- Scheduler tries `POST {SMALL_LLM_API_BASE or BIG_LLM_API_BASE}/responses` first.
+- If `responses` fails or payload cannot be parsed, it falls back to `POST {SMALL_LLM_API_BASE or BIG_LLM_API_BASE}/chat/completions`.
 
 ## Tier config
 
