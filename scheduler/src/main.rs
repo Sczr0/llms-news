@@ -1657,7 +1657,7 @@ fn enqueue_candidate_alerts(
             "INSERT INTO alerts (
                 url_hash, story_key, story_fingerprint, published_day, status,
                 attempt_count, next_retry_at, last_error, payload_json, created_at, sent_at
-             ) VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, NULL, ?6, ?7, NULL)",
+             ) VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, NULL, ?6, ?7, '')",
             params![
                 item.url_hash,
                 item.story_key,
@@ -2121,6 +2121,39 @@ mod tests {
 
         let enqueued = enqueue_candidate_alerts(&conn, &cfg, vec![candidate])?;
         assert_eq!(enqueued, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn enqueue_is_compatible_with_legacy_alerts_sent_at_not_null() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            r#"
+CREATE TABLE alerts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  url_hash TEXT NOT NULL UNIQUE,
+  sent_at TEXT NOT NULL
+);
+"#,
+        )?;
+        init_db(&conn)?;
+
+        let cfg = test_config();
+        let candidate = test_candidate(
+            "OpenAI releases GPT-5.4 API for enterprise developers",
+            "https://example.com/legacy-alert",
+        );
+
+        let enqueued = enqueue_candidate_alerts(&conn, &cfg, vec![candidate.clone()])?;
+        assert_eq!(enqueued, 1);
+
+        let (status, sent_at): (String, String) = conn.query_row(
+            "SELECT status, sent_at FROM alerts WHERE story_key = ?1",
+            [candidate.story_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(status, "pending");
+        assert_eq!(sent_at, "");
         Ok(())
     }
 
