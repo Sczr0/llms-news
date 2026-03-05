@@ -9,6 +9,8 @@ Rust scheduler for:
 - Tier routing by configurable file (`P0/P1/P2`).
 - Dual-LLM pipeline (small filter + big Chinese rewrite, OpenAI-compatible API).
 - Notification (console or webhook, Feishu interactive card supported).
+- Notification retry based on SQLite state.
+- Heuristic semantic dedupe based on story fingerprint.
 
 ## Run
 
@@ -49,6 +51,9 @@ cp .env.example .env
 - `SOURCE_TIER_CONFIG`
 - `HARVEST_ROUNDS`
 - `CANDIDATE_MIN_SCORE`
+- `ALERT_RETRY_MAX_ATTEMPTS`
+- `ALERT_RETRY_BASE_SECS`
+- `SEMANTIC_DEDUPE_LOOKBACK_HOURS`
 - `NOTIFY_WEBHOOK`
 - `SMALL_LLM_API_BASE` / `SMALL_LLM_API_KEY` / `SMALL_LLM_MODEL` / `SMALL_LLM_CONCURRENCY`
 - `BIG_LLM_API_BASE` / `BIG_LLM_API_KEY` / `BIG_LLM_MODEL` / `BIG_LLM_MAX_ITEMS` / `BIG_LLM_CONCURRENCY`
@@ -90,4 +95,12 @@ When webhook host contains `open.feishu.cn`, scheduler sends `interactive` card 
 
 - `raw_items`: raw fetched items.
 - `events`: topic/score records.
-- `alerts`: sent dedupe.
+- `alerts`: retry queue + sent dedupe.
+
+## Alert delivery behavior
+
+- New shortlisted candidates are first enqueued into `alerts`.
+- Webhook success marks one alert as `sent`.
+- Webhook failure marks one alert as `failed` and schedules next retry by backoff.
+- Semantic dedupe uses a story fingerprint built from normalized title and short content tokens.
+- Recent sent alerts within `SEMANTIC_DEDUPE_LOOKBACK_HOURS` suppress repeated delivery for the same story.
