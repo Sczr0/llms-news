@@ -7,7 +7,7 @@ Rust scheduler for:
 - Dedupe + store in SQLite.
 - Rule-based classification/scoring.
 - Tier routing by configurable file (`P0/P1/P2`).
-- Dual-LLM pipeline (small filter + big Chinese rewrite, OpenAI-compatible API).
+- Dual-LLM pipeline (small filter + big Chinese rewrite, via `async-openai-compat`).
 - Notification (console or webhook, Feishu interactive card supported).
 - Notification retry based on SQLite state.
 - Heuristic semantic dedupe based on story fingerprint.
@@ -56,7 +56,10 @@ cp .env.example .env
 - `SEMANTIC_DEDUPE_LOOKBACK_HOURS`
 - `NOTIFY_WEBHOOK`
 - `SMALL_LLM_API_BASE` / `SMALL_LLM_API_KEY` / `SMALL_LLM_MODEL` / `SMALL_LLM_CONCURRENCY`
+- `SMALL_LLM_API_PROTOCOL`
 - `BIG_LLM_API_BASE` / `BIG_LLM_API_KEY` / `BIG_LLM_MODEL` / `BIG_LLM_MAX_ITEMS` / `BIG_LLM_CONCURRENCY`
+- `BIG_LLM_API_PROTOCOL`
+- `LLM_API_PROTOCOL`
 
 Production example:
 
@@ -71,8 +74,11 @@ Dual-LLM pipeline:
 
 LLM protocol behavior (both small and big models):
 
-- Scheduler tries `POST {SMALL_LLM_API_BASE or BIG_LLM_API_BASE}/responses` first.
-- If `responses` fails or payload cannot be parsed, it falls back to `POST {SMALL_LLM_API_BASE or BIG_LLM_API_BASE}/chat/completions`.
+- `SMALL_LLM_API_PROTOCOL` / `BIG_LLM_API_PROTOCOL` support `auto`, `responses`, `chat`.
+- Default `auto` mode tries `POST {API_BASE}/responses` first.
+- `auto` falls back to `POST {API_BASE}/chat/completions` only when the provider clearly reports that `/responses` is unsupported or unavailable.
+- Request-body errors, invalid JSON output, and normal model failures stay on the original protocol and are logged instead of silently falling back.
+- Legacy `LLM_API_PROTOCOL` is still honored when `BIG_LLM_*` is omitted.
 
 ## Tier config
 

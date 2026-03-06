@@ -10,3 +10,6 @@ scheduler/data/
 # Env
 *.env
 *.local
+
+.codex
+verification.md

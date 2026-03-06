@@ -5,6 +5,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use async_openai_compat::config::OpenAIConfig;
+use async_openai_compat::error::OpenAIError;
+use async_openai_compat::types::chat::{
+    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+    ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs, ResponseFormat,
+};
+use async_openai_compat::types::responses::{
+    CreateResponseArgs, ResponseTextParam, TextResponseFormatConfiguration,
+};
+use async_openai_compat::Client as OpenAiCompatClient;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::header::{HeaderMap, HeaderValue};
 use rusqlite::{params, Connection};
@@ -38,6 +48,7 @@ struct SmallLlmConfig {
     api_base: String,
     api_key: String,
     model: String,
+    protocol: LlmApiProtocol,
     concurrency: usize,
 }
 
@@ -46,8 +57,16 @@ struct BigLlmConfig {
     api_base: String,
     api_key: String,
     model: String,
+    protocol: LlmApiProtocol,
     max_items: usize,
     concurrency: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LlmApiProtocol {
+    Auto,
+    Responses,
+    Chat,
 }
 
 #[derive(Debug, Deserialize)]
@@ -234,6 +253,33 @@ Return strict JSON only with keys:
 - opinion: string"#
 }
 
+impl LlmApiProtocol {
+    fn parse_env(var_name: &str, raw: Option<&str>) -> Result<Self> {
+        let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::Auto);
+        };
+
+        match raw.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "responses" => Ok(Self::Responses),
+            "chat" | "chat_completions" | "chat-completions" | "chat/completions" => Ok(Self::Chat),
+            _ => bail!(
+                "invalid {}={}, expected auto | responses | chat",
+                var_name,
+                raw
+            ),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Responses => "responses",
+            Self::Chat => "chat",
+        }
+    }
+}
+
 fn strip_markdown_code_fence(raw: &str) -> String {
     let trimmed = raw.trim();
     if !trimmed.starts_with("```") {
@@ -263,81 +309,91 @@ fn parse_json_value(content: &str) -> Option<serde_json::Value> {
     serde_json::from_str::<serde_json::Value>(normalized.trim()).ok()
 }
 
-fn extract_text_from_chat_payload(payload: &serde_json::Value) -> Option<String> {
-    let msg_content = payload
-        .get("choices")?
-        .as_array()?
-        .first()?
-        .get("message")?
-        .get("content")?;
+fn build_openai_client(
+    http_client: &reqwest::Client,
+    api_base: &str,
+    api_key: &str,
+) -> OpenAiCompatClient<OpenAIConfig> {
+    let config = OpenAIConfig::new()
+        .with_api_base(api_base.to_string())
+        .with_api_key(api_key.to_string());
+    OpenAiCompatClient::with_config(config).with_http_client(http_client.clone())
+}
 
-    if let Some(text) = msg_content.as_str() {
-        return Some(text.to_string());
-    }
-
-    let mut parts = Vec::new();
-    if let Some(arr) = msg_content.as_array() {
-        for part in arr {
-            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                parts.push(text.to_string());
-                continue;
+fn describe_openai_error(error: &OpenAIError) -> String {
+    match error {
+        OpenAIError::ApiError(api_error) => {
+            let mut parts = vec![format!("message={}", api_error.message)];
+            if let Some(error_type) = &api_error.r#type {
+                parts.push(format!("type={error_type}"));
             }
-            if let Some(text) = part
-                .get("text")
-                .and_then(|v| v.get("value"))
-                .and_then(|v| v.as_str())
-            {
-                parts.push(text.to_string());
+            if let Some(code) = &api_error.code {
+                parts.push(format!("code={code}"));
             }
+            if let Some(param) = &api_error.param {
+                parts.push(format!("param={param}"));
+            }
+            parts.join(" ")
         }
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n"))
+        OpenAIError::Reqwest(reqwest_error) => {
+            let mut parts = vec![reqwest_error.to_string()];
+            if let Some(status) = reqwest_error.status() {
+                parts.push(format!("status={status}"));
+            }
+            parts.join(" ")
+        }
+        OpenAIError::JSONDeserialize(_, body) => {
+            format!(
+                "failed to deserialize provider response: {}",
+                truncate_chars(body, 400)
+            )
+        }
+        _ => error.to_string(),
     }
 }
 
-fn extract_text_from_responses_payload(payload: &serde_json::Value) -> Option<String> {
-    if let Some(text) = payload.get("output_text").and_then(|v| v.as_str()) {
-        return Some(text.to_string());
-    }
-    if let Some(arr) = payload.get("output_text").and_then(|v| v.as_array()) {
-        let texts: Vec<String> = arr
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect();
-        if !texts.is_empty() {
-            return Some(texts.join("\n"));
+fn is_endpoint_not_supported_text(text: &str) -> bool {
+    [
+        "unsupported legacy protocol",
+        "not supported",
+        "unsupported protocol",
+        "unknown path",
+        "no route",
+        "404",
+        "405",
+        "not found",
+        "not_found",
+        "method not allowed",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
+}
+
+fn should_fallback_from_responses_to_chat(error: &OpenAIError) -> bool {
+    match error {
+        OpenAIError::ApiError(api_error) => {
+            let text = format!(
+                "{} {} {}",
+                api_error.message,
+                api_error.r#type.as_deref().unwrap_or(""),
+                api_error.code.as_deref().unwrap_or("")
+            )
+            .to_ascii_lowercase();
+            let mentions_responses = text.contains("/responses") || text.contains("responses");
+            let mentions_chat =
+                text.contains("/chat/completions") || text.contains("chat/completions");
+            is_endpoint_not_supported_text(&text) && (mentions_responses || mentions_chat)
         }
-    }
-
-    let mut parts = Vec::new();
-    if let Some(output_items) = payload.get("output").and_then(|v| v.as_array()) {
-        for output in output_items {
-            if let Some(content_items) = output.get("content").and_then(|v| v.as_array()) {
-                for content in content_items {
-                    if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
-                        parts.push(text.to_string());
-                        continue;
-                    }
-                    if let Some(text) = content
-                        .get("text")
-                        .and_then(|v| v.get("value"))
-                        .and_then(|v| v.as_str())
-                    {
-                        parts.push(text.to_string());
-                    }
-                }
-            }
+        OpenAIError::Reqwest(reqwest_error) => reqwest_error
+            .status()
+            .map(|status| matches!(status.as_u16(), 404 | 405 | 410 | 501))
+            .unwrap_or(false),
+        OpenAIError::JSONDeserialize(_, body) => {
+            let text = body.to_ascii_lowercase();
+            is_endpoint_not_supported_text(&text)
         }
+        _ => false,
     }
-
-    if !parts.is_empty() {
-        return Some(parts.join("\n"));
-    }
-
-    extract_text_from_chat_payload(payload)
 }
 
 impl SourceTierConfig {
@@ -587,6 +643,9 @@ fn load_config() -> Result<Config> {
     let small_llm_model = env::var("SMALL_LLM_MODEL")
         .ok()
         .map(|v| v.trim().to_string());
+    let small_llm_api_protocol = env::var("SMALL_LLM_API_PROTOCOL")
+        .ok()
+        .map(|v| v.trim().to_string());
     let small_llm_concurrency = env::var("SMALL_LLM_CONCURRENCY")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -595,6 +654,9 @@ fn load_config() -> Result<Config> {
     let legacy_llm_api_base = env::var("LLM_API_BASE").ok().map(|v| v.trim().to_string());
     let legacy_llm_api_key = env::var("LLM_API_KEY").ok().map(|v| v.trim().to_string());
     let legacy_llm_model = env::var("LLM_MODEL").ok().map(|v| v.trim().to_string());
+    let legacy_llm_api_protocol = env::var("LLM_API_PROTOCOL")
+        .ok()
+        .map(|v| v.trim().to_string());
     let legacy_llm_max_items = env::var("LLM_MAX_ITEMS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -612,6 +674,10 @@ fn load_config() -> Result<Config> {
         .ok()
         .map(|v| v.trim().to_string())
         .or_else(|| legacy_llm_model.clone());
+    let big_llm_api_protocol = env::var("BIG_LLM_API_PROTOCOL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .or_else(|| legacy_llm_api_protocol.clone());
     let big_llm_max_items = env::var("BIG_LLM_MAX_ITEMS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -625,10 +691,15 @@ fn load_config() -> Result<Config> {
         (Some(api_base), Some(api_key), Some(model))
             if !api_base.is_empty() && !api_key.is_empty() && !model.is_empty() =>
         {
+            let protocol = LlmApiProtocol::parse_env(
+                "SMALL_LLM_API_PROTOCOL",
+                small_llm_api_protocol.as_deref(),
+            )?;
             Some(SmallLlmConfig {
                 api_base: api_base.trim_end_matches('/').to_string(),
                 api_key,
                 model,
+                protocol,
                 concurrency: small_llm_concurrency.max(1),
             })
         }
@@ -639,10 +710,13 @@ fn load_config() -> Result<Config> {
         (Some(api_base), Some(api_key), Some(model))
             if !api_base.is_empty() && !api_key.is_empty() && !model.is_empty() =>
         {
+            let protocol =
+                LlmApiProtocol::parse_env("BIG_LLM_API_PROTOCOL", big_llm_api_protocol.as_deref())?;
             Some(BigLlmConfig {
                 api_base: api_base.trim_end_matches('/').to_string(),
                 api_key,
                 model,
+                protocol,
                 max_items: big_llm_max_items,
                 concurrency: big_llm_concurrency.max(1),
             })
@@ -1458,6 +1532,7 @@ async fn call_small_llm_for_candidate(
         &llm.api_base,
         &llm.api_key,
         &llm.model,
+        llm.protocol,
         small_llm_system_prompt(),
         &user_prompt,
     )
@@ -1465,7 +1540,18 @@ async fn call_small_llm_for_candidate(
     else {
         return Ok(None);
     };
-    Ok(serde_json::from_value::<SmallLlmDecision>(payload).ok())
+    match serde_json::from_value::<SmallLlmDecision>(payload) {
+        Ok(decision) => Ok(Some(decision)),
+        Err(error) => {
+            println!(
+                "[scheduler] small-llm parse failed model={} protocol={} error={}",
+                llm.model,
+                llm.protocol.as_str(),
+                error
+            );
+            Ok(None)
+        }
+    }
 }
 
 async fn call_big_llm_for_candidate(
@@ -1488,6 +1574,7 @@ async fn call_big_llm_for_candidate(
         &llm.api_base,
         &llm.api_key,
         &llm.model,
+        llm.protocol,
         big_llm_system_prompt(),
         &user_prompt,
     )
@@ -1495,112 +1582,176 @@ async fn call_big_llm_for_candidate(
     else {
         return Ok(None);
     };
-    Ok(serde_json::from_value::<BigLlmDecision>(payload).ok())
+    match serde_json::from_value::<BigLlmDecision>(payload) {
+        Ok(decision) => Ok(Some(decision)),
+        Err(error) => {
+            println!(
+                "[scheduler] big-llm parse failed model={} protocol={} error={}",
+                llm.model,
+                llm.protocol.as_str(),
+                error
+            );
+            Ok(None)
+        }
+    }
 }
 
 async fn call_llm_json(
-    client: &reqwest::Client,
+    http_client: &reqwest::Client,
     api_base: &str,
     api_key: &str,
     model: &str,
+    protocol: LlmApiProtocol,
     system_prompt: &str,
     user_prompt: &str,
 ) -> Result<Option<serde_json::Value>> {
-    if let Some(payload) =
-        call_llm_json_via_responses(client, api_base, api_key, model, system_prompt, user_prompt)
-            .await?
-    {
-        return Ok(Some(payload));
+    let client = build_openai_client(http_client, api_base, api_key);
+
+    match protocol {
+        LlmApiProtocol::Responses => {
+            match call_llm_json_via_responses(&client, model, system_prompt, user_prompt).await {
+                Ok(payload) => Ok(payload),
+                Err(error) => {
+                    println!(
+                        "[scheduler] llm call failed model={} protocol={} api_base={} error={}",
+                        model,
+                        protocol.as_str(),
+                        api_base,
+                        describe_openai_error(&error)
+                    );
+                    Err(error.into())
+                }
+            }
+        }
+        LlmApiProtocol::Chat => {
+            match call_llm_json_via_chat(&client, model, system_prompt, user_prompt).await {
+                Ok(payload) => Ok(payload),
+                Err(error) => {
+                    println!(
+                        "[scheduler] llm call failed model={} protocol={} api_base={} error={}",
+                        model,
+                        protocol.as_str(),
+                        api_base,
+                        describe_openai_error(&error)
+                    );
+                    Err(error.into())
+                }
+            }
+        }
+        LlmApiProtocol::Auto => {
+            match call_llm_json_via_responses(&client, model, system_prompt, user_prompt).await {
+                Ok(payload) => Ok(payload),
+                Err(error) if should_fallback_from_responses_to_chat(&error) => {
+                    println!(
+                        "[scheduler] llm protocol fallback model={} from=responses to=chat api_base={} reason={}",
+                        model,
+                        api_base,
+                        describe_openai_error(&error)
+                    );
+                    match call_llm_json_via_chat(&client, model, system_prompt, user_prompt).await {
+                        Ok(payload) => Ok(payload),
+                        Err(chat_error) => {
+                            println!(
+                                "[scheduler] llm fallback failed model={} protocol=chat api_base={} error={}",
+                                model,
+                                api_base,
+                                describe_openai_error(&chat_error)
+                            );
+                            Err(chat_error.into())
+                        }
+                    }
+                }
+                Err(error) => {
+                    println!(
+                        "[scheduler] llm call failed model={} protocol=responses api_base={} error={}",
+                        model,
+                        api_base,
+                        describe_openai_error(&error)
+                    );
+                    Err(error.into())
+                }
+            }
+        }
     }
-    call_llm_json_via_chat(client, api_base, api_key, model, system_prompt, user_prompt).await
 }
 
 async fn call_llm_json_via_responses(
-    client: &reqwest::Client,
-    api_base: &str,
-    api_key: &str,
+    client: &OpenAiCompatClient<OpenAIConfig>,
     model: &str,
     system_prompt: &str,
     user_prompt: &str,
-) -> Result<Option<serde_json::Value>> {
-    let url = format!("{}/responses", api_base);
-    let body = serde_json::json!({
-      "model": model,
-      "temperature": 0.2,
-      "instructions": system_prompt,
-      "input": user_prompt,
-      "text": { "format": { "type": "json_object" } }
-    });
-    let resp = client
-        .post(url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await;
-    let Ok(resp) = resp else {
+) -> std::result::Result<Option<serde_json::Value>, OpenAIError> {
+    let request = CreateResponseArgs::default()
+        .model(model)
+        .temperature(0.2)
+        .instructions(system_prompt)
+        .input(user_prompt.to_string())
+        .text(ResponseTextParam::from(
+            TextResponseFormatConfiguration::JsonObject,
+        ))
+        .build()?;
+    let response = client.responses().create(request).await?;
+    let Some(content) = response.output_text() else {
+        println!(
+            "[scheduler] llm responses returned no output_text model={}",
+            model
+        );
         return Ok(None);
     };
-    let resp = match resp.error_for_status() {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
-    };
-    let payload = match resp.json::<serde_json::Value>().await {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
-    };
-    let content = extract_text_from_responses_payload(&payload);
-    let Some(content) = content else {
-        return Ok(None);
-    };
-    Ok(parse_json_value(&content))
+    let parsed = parse_json_value(&content);
+    if parsed.is_none() {
+        println!(
+            "[scheduler] llm responses returned non-json content model={} content={}",
+            model,
+            truncate_chars(&content, 400)
+        );
+    }
+    Ok(parsed)
 }
 
 async fn call_llm_json_via_chat(
-    client: &reqwest::Client,
-    api_base: &str,
-    api_key: &str,
+    client: &OpenAiCompatClient<OpenAIConfig>,
     model: &str,
     system_prompt: &str,
     user_prompt: &str,
-) -> Result<Option<serde_json::Value>> {
-    let url = format!("{}/chat/completions", api_base);
-    let body = serde_json::json!({
-      "model": model,
-      "temperature": 0.2,
-      "response_format": { "type": "json_object" },
-      "messages": [
-        {
-          "role": "system",
-          "content": system_prompt
-        },
-        {
-          "role": "user",
-          "content": user_prompt
-        }
-      ]
-    });
-    let resp = client
-        .post(url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await;
-    let Ok(resp) = resp else {
-        return Ok(None);
-    };
-    let resp = match resp.error_for_status() {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
-    };
-    let payload = match resp.json::<serde_json::Value>().await {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
-    };
-    let content = extract_text_from_chat_payload(&payload);
+) -> std::result::Result<Option<serde_json::Value>, OpenAIError> {
+    let system_message = ChatCompletionRequestSystemMessageArgs::default()
+        .content(system_prompt)
+        .build()?;
+    let user_message = ChatCompletionRequestUserMessageArgs::default()
+        .content(user_prompt)
+        .build()?;
+    let request = CreateChatCompletionRequestArgs::default()
+        .model(model)
+        .temperature(0.2)
+        .response_format(ResponseFormat::JsonObject)
+        .messages(vec![
+            ChatCompletionRequestMessage::System(system_message),
+            ChatCompletionRequestMessage::User(user_message),
+        ])
+        .build()?;
+    let response = client.chat().create(request).await?;
+    let content = response
+        .choices
+        .first()
+        .and_then(|choice| choice.message.content.as_deref())
+        .map(str::to_string);
     let Some(content) = content else {
+        println!(
+            "[scheduler] llm chat returned empty message content model={}",
+            model
+        );
         return Ok(None);
     };
-    Ok(parse_json_value(&content))
+    let parsed = parse_json_value(&content);
+    if parsed.is_none() {
+        println!(
+            "[scheduler] llm chat returned non-json content model={} content={}",
+            model,
+            truncate_chars(&content, 400)
+        );
+    }
+    Ok(parsed)
 }
 
 fn enqueue_candidate_alerts(
@@ -2162,5 +2313,44 @@ CREATE TABLE alerts (
         let cfg = test_config();
         assert!(compute_retry_delay_secs(&cfg, 2) > compute_retry_delay_secs(&cfg, 1));
         assert!(compute_retry_delay_secs(&cfg, 6) >= compute_retry_delay_secs(&cfg, 5));
+    }
+
+    #[test]
+    fn llm_api_protocol_parses_expected_values() -> Result<()> {
+        assert_eq!(
+            LlmApiProtocol::parse_env("TEST_PROTOCOL", None)?,
+            LlmApiProtocol::Auto
+        );
+        assert_eq!(
+            LlmApiProtocol::parse_env("TEST_PROTOCOL", Some("responses"))?,
+            LlmApiProtocol::Responses
+        );
+        assert_eq!(
+            LlmApiProtocol::parse_env("TEST_PROTOCOL", Some("chat/completions"))?,
+            LlmApiProtocol::Chat
+        );
+        assert!(LlmApiProtocol::parse_env("TEST_PROTOCOL", Some("legacy")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn responses_fallback_only_triggers_for_protocol_mismatch() {
+        let unsupported_error = OpenAIError::ApiError(async_openai_compat::error::ApiError {
+            message:
+                "Unsupported protocol: /v1/responses is not supported. Please use /v1/chat/completions."
+                    .to_string(),
+            r#type: Some("invalid_request_error".to_string()),
+            param: None,
+            code: None,
+        });
+        assert!(should_fallback_from_responses_to_chat(&unsupported_error));
+
+        let parse_error = OpenAIError::ApiError(async_openai_compat::error::ApiError {
+            message: "Failed to parse request body".to_string(),
+            r#type: Some("invalid_request_error".to_string()),
+            param: None,
+            code: None,
+        });
+        assert!(!should_fallback_from_responses_to_chat(&parse_error));
     }
 }
